@@ -49,6 +49,10 @@ DEFAULT_BUTTON_MAP = {
 
 DEFAULT_CALIBRATION_FILE = Path(__file__).with_name('wheel_calibration.json')
 
+# Telemetry wire format (must match remoteControl.py)
+TELEMETRY_FORMAT = '<ffBBBBBBfBBf'
+TELEMETRY_SIZE = struct.calcsize(TELEMETRY_FORMAT)
+
 # Keyboard control settings
 KEYBOARD_STEER_SPEED = 2.0  # How fast steering moves with A/D (per second)
 KEYBOARD_STEER_RETURN = 3.0  # How fast steering returns to center (per second)
@@ -85,6 +89,7 @@ class TelemetryReceiver:
     self.cruise_speed = 0.0
     self.lat_active = False
     self.long_active = False
+    self.current_speed = 0.0
 
   def start(self):
     self.running = True
@@ -111,16 +116,17 @@ class TelemetryReceiver:
           print("Telemetry stream connected!")
 
           while self.running:
-            # Receive telemetry packet (18 bytes)
-            data = self._recv_exact(s, 18)
+            # Receive telemetry packet
+            data = self._recv_exact(s, TELEMETRY_SIZE)
             if not data:
               break
 
-            # Unpack: 2 floats + 8 bytes + 1 float + 2 bytes
+            # Unpack telemetry packet from remoteControl.py format
             (self.speed_mph, self.steering_angle,
              self.engaged, self.gear, self.left_blinker, self.right_blinker,
              self.brake_pressed, self.gas_pressed, self.cruise_speed,
-             self.lat_active, self.long_active) = struct.unpack('ffBBBBBBfBB', data)
+             self.lat_active, self.long_active,
+             self.current_speed) = struct.unpack(TELEMETRY_FORMAT, data)
 
             with telemetry_lock:
               telemetry_data = self

@@ -10,6 +10,7 @@ import struct
 import threading
 import time
 import argparse
+import traceback
 
 # Button bit positions (must match TestRemotecontrol.py)
 BTN_CANCEL = 0
@@ -20,6 +21,11 @@ BTN_GEAR_DOWN = 4
 BTN_CRUISE_UP = 5
 BTN_CRUISE_DOWN = 6
 BTN_CRUISE_MAIN = 7
+
+# Telemetry wire format (little-endian, standard sizes, no native padding)
+# speed_mph, steering_angle, engaged, gear, left_blinker, right_blinker,
+# brake_pressed, gas_pressed, cruise_speed, lat_active, long_active, current_speed
+TELEMETRY_FORMAT = '<ffBBBBBBfBBf'
 
 # Import messaging on comma only
 messaging = None
@@ -35,14 +41,48 @@ if sys.platform != 'win32':
     pass
 
 
-def video_stream_thread(host, port, camera='road', fps=20):
+def video_stream_thread(host, port, camera='road', fps=20, width=640, height=360, jpeg_quality=60):
   """Stream video frames via TCP socket."""
   if VisionIpcClient is None:
     print("VisionIpcClient not available, video streaming disabled")
     return
 
-  import cv2
+  import importlib
   import numpy as np
+
+  try:
+    cv2 = importlib.import_module('cv2')
+  except Exception:
+    print("OpenCV (cv2) is required for high-FPS streaming. Install opencv-python on this runtime.")
+    return
+
+  def c_contig(arr):
+    return arr if arr.flags.c_contiguous else np.ascontiguousarray(arr)
+
+  def vipc_buf_to_bgr(buf):
+    """Convert VisionIPC YUV buffer to BGR quickly, handling stride padding."""
+    if not hasattr(buf, 'uv_offset') or not hasattr(buf, 'stride'):
+      # Fallback path for legacy/simple I420 buffers (packed, no stride metadata).
+      h, w = int(buf.height), int(buf.width)
+      flat = np.frombuffer(bytes(buf.data), dtype=np.uint8)
+      yuv = flat.reshape((h * 3 // 2, w))
+      return c_contig(cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420))
+
+    h, w = int(buf.height), int(buf.width)
+    stride = int(buf.stride)
+    raw = np.frombuffer(bytes(buf.data), dtype=np.uint8)
+
+    # Build compact I420 from stride-padded Y + interleaved UV (NV12-like) planes.
+    y_plane = raw[:buf.uv_offset].reshape((-1, stride))[:h, :w].copy()
+    uv_interleaved = raw[buf.uv_offset:].reshape((-1, stride))[:h // 2, :w]
+    u_plane = uv_interleaved[:, 0::2].copy()
+    v_plane = uv_interleaved[:, 1::2].copy()
+
+    i420 = np.empty((h * 3 // 2, w), dtype=np.uint8)
+    i420[:h, :] = y_plane
+    i420[h:h + h // 4, :] = u_plane.reshape(-1, w)
+    i420[h + h // 4:, :] = v_plane.reshape(-1, w)
+    return c_contig(cv2.cvtColor(i420, cv2.COLOR_YUV2BGR_I420))
 
   # Map camera name to stream type
   stream_map = {
@@ -87,16 +127,12 @@ def video_stream_thread(host, port, camera='road', fps=20):
               time.sleep(0.01)
               continue
 
-            # Convert YUV to BGR
-            # Frame is in YUV420 format
-            yuv = np.frombuffer(buf.data, dtype=np.uint8).reshape((buf.height * 3 // 2, buf.width))
-            frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
-
-            # Resize for bandwidth (optional - adjust quality)
-            frame = cv2.resize(frame, (640, 360))
-
-            # Encode as JPEG
-            _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            # Convert YUV -> BGR and encode with OpenCV for significantly better FPS.
+            frame = vipc_buf_to_bgr(buf)
+            frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+            ok, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+            if not ok:
+              continue
             jpeg_bytes = jpeg.tobytes()
 
             # Send frame: 4-byte length prefix + JPEG data
@@ -114,6 +150,7 @@ def video_stream_thread(host, port, camera='road', fps=20):
 
       except Exception as e:
         print(f"Video stream error: {e}")
+        print(traceback.format_exc())
         time.sleep(1)
 
 
@@ -150,7 +187,7 @@ def telemetry_stream_thread(host, port, rate=20):
             # Pack telemetry data
             # Format: speed_mph(f), steering_angle(f), engaged(B), gear(B),
             #         left_blinker(B), right_blinker(B), brake_pressed(B), gas_pressed(B),
-            #         cruise_speed(f), lat_active(B), long_active(B)
+            #         cruise_speed(f), lat_active(B), long_active(B), current_speed(f)
             speed_mph = cs.vEgo * 2.237  # m/s to mph
             steering_angle = cs.steeringAngleDeg
             engaged = ss.enabled
@@ -168,8 +205,7 @@ def telemetry_stream_thread(host, port, rate=20):
             lat_active = ss.active
             long_active = ss.enabled
 
-            # Pack: 2 floats + 8 bytes + 1 float + 2 bytes = 18 bytes
-            data = struct.pack('ffBBBBBBfBBf',
+            data = struct.pack(TELEMETRY_FORMAT,
                               speed_mph, steering_angle,
                               engaged, gear, left_blinker, right_blinker,
                               brake_pressed, gas_pressed, cruise_speed,
@@ -208,6 +244,7 @@ def remote_control_thread(control_port=6969):
     return data
 
   HOST = '0.0.0.0'
+  last_print_t = 0.0
   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((HOST, control_port))
@@ -247,8 +284,11 @@ def remote_control_thread(control_port=6969):
           if cruise_down: btn_status.append("CRUISE-")
           if cruise_main: btn_status.append("MAIN")
 
-          btn_str = f" [{', '.join(btn_status)}]" if btn_status else ""
-          print(f"Received: steer={steering:+.2f}, gas_brake={gas_brake:+.2f}{btn_str}")
+          now = time.time()
+          if now - last_print_t > 0.25:
+            btn_str = f" [{', '.join(btn_status)}]" if btn_status else ""
+            print(f"Received: steer={steering:+.2f}, gas_brake={gas_brake:+.2f}{btn_str}")
+            last_print_t = now
 
           if pm is not None:
             # Create and send the joystick message
@@ -265,6 +305,9 @@ def main():
   parser = argparse.ArgumentParser(description='Remote Control Server')
   parser.add_argument('--video', action='store_true', help='Enable video streaming')
   parser.add_argument('--video-port', type=int, default=6970, help='Video stream port (default: 6970)')
+  parser.add_argument('--video-width', type=int, default=640, help='Video width (default: 640)')
+  parser.add_argument('--video-height', type=int, default=360, help='Video height (default: 360)')
+  parser.add_argument('--jpeg-quality', type=int, default=60, help='JPEG quality 1-100 (default: 60)')
   parser.add_argument('--telemetry', action='store_true', help='Enable telemetry streaming')
   parser.add_argument('--telemetry-port', type=int, default=6971, help='Telemetry stream port (default: 6971)')
   parser.add_argument('--control-port', type=int, default=6969, help='Control port (default: 6969)')
@@ -276,7 +319,7 @@ def main():
   if args.video:
     video_thread = threading.Thread(
       target=video_stream_thread,
-      args=('0.0.0.0', args.video_port, args.camera, args.fps),
+      args=('0.0.0.0', args.video_port, args.camera, args.fps, args.video_width, args.video_height, args.jpeg_quality),
       daemon=True
     )
     video_thread.start()
