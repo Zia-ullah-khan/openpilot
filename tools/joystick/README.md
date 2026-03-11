@@ -39,3 +39,7 @@ python remoteControl.py --video --telemetry
 
 # Client (PC)
 python TestRemotecontrol.py --host <comma_ip> --video --telemetry --no-server
+
+# To enable camera when comma is not connected to car:
+cd /data/openpilot
+python -c "from openpilot.common.params import Params; p=Params(); p.put_bool('IsDriverViewEnabled', True); p.put_bool('JoystickDebugMode', True); print('enabled')"
