@@ -17,7 +17,7 @@ EXPO = 0.4
 class Keyboard:
   def __init__(self):
     self.kb = KBHit()
-    self.axis_increment = 0.05  # 5% of full actuation each key press
+    self.axis_increment = 0.01  # 1% of full actuation each key press
     self.axes_map = {'w': 'gb', 's': 'gb',
                      'a': 'steer', 'd': 'steer'}
     self.axes_values = {'gb': 0., 'steer': 0.}
