@@ -61,7 +61,7 @@ def video_stream_thread(host, port, camera='road', fps=20):
 
   # Connect to vision IPC
   vipc = VisionIpcClient("camerad", stream_type, True)
-  if not vipc.connect(block=True):
+  if not vipc.connect(True):
     print("Failed to connect to camerad")
     return
 
@@ -197,63 +197,68 @@ def remote_control_thread(control_port=6969):
     sm = messaging.SubMaster(['testJoystick'], frequency=1. / 0.1)
     pm = messaging.PubMaster(['testJoystick'])
 
+  def recv_exact(sock, size):
+    """Receive exactly size bytes from TCP stream or return None on disconnect."""
+    data = b''
+    while len(data) < size:
+      chunk = sock.recv(size - len(data))
+      if not chunk:
+        return None
+      data += chunk
+    return data
+
   HOST = '0.0.0.0'
   with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((HOST, control_port))
     s.listen()
     print(f"Listening for remote control data on {HOST}:{control_port}...")
-    conn, addr = s.accept()
-    with conn:
-      print(f"Connected by {addr}")
-      while True:
-        # New format: 2 floats + 1 byte = 9 bytes
-        data = conn.recv(9)
-        if not data:
-          break
+    while True:
+      conn, addr = s.accept()
+      with conn:
+        print(f"Connected by {addr}")
+        while True:
+          # New format: 2 floats + 1 byte = 9 bytes
+          data = recv_exact(conn, 9)
+          if data is None:
+            print("Control client disconnected")
+            break
 
-        # Handle both old (8 bytes) and new (9 bytes) format
-        if len(data) == 8:
-          steering, gas_brake = struct.unpack('ff', data)
-          button_mask = 0
-        elif len(data) >= 9:
-          steering, gas_brake, button_mask = struct.unpack('ffB', data[:9])
-        else:
-          continue
+          steering, gas_brake, button_mask = struct.unpack('ffB', data)
 
-        # Decode button states
-        cancel = bool(button_mask & (1 << BTN_CANCEL))
-        left_blinker = bool(button_mask & (1 << BTN_LEFT_BLINKER))
-        right_blinker = bool(button_mask & (1 << BTN_RIGHT_BLINKER))
-        gear_up = bool(button_mask & (1 << BTN_GEAR_UP))
-        gear_down = bool(button_mask & (1 << BTN_GEAR_DOWN))
-        cruise_up = bool(button_mask & (1 << BTN_CRUISE_UP))
-        cruise_down = bool(button_mask & (1 << BTN_CRUISE_DOWN))
-        cruise_main = bool(button_mask & (1 << BTN_CRUISE_MAIN))
+          # Decode button states
+          cancel = bool(button_mask & (1 << BTN_CANCEL))
+          left_blinker = bool(button_mask & (1 << BTN_LEFT_BLINKER))
+          right_blinker = bool(button_mask & (1 << BTN_RIGHT_BLINKER))
+          gear_up = bool(button_mask & (1 << BTN_GEAR_UP))
+          gear_down = bool(button_mask & (1 << BTN_GEAR_DOWN))
+          cruise_up = bool(button_mask & (1 << BTN_CRUISE_UP))
+          cruise_down = bool(button_mask & (1 << BTN_CRUISE_DOWN))
+          cruise_main = bool(button_mask & (1 << BTN_CRUISE_MAIN))
 
-        # Build button status string
-        btn_status = []
-        if cancel: btn_status.append("CANCEL")
-        if left_blinker: btn_status.append("LEFT")
-        if right_blinker: btn_status.append("RIGHT")
-        if gear_up: btn_status.append("GEAR_UP")
-        if gear_down: btn_status.append("GEAR_DOWN")
-        if cruise_up: btn_status.append("CRUISE+")
-        if cruise_down: btn_status.append("CRUISE-")
-        if cruise_main: btn_status.append("MAIN")
+          # Build button status string
+          btn_status = []
+          if cancel: btn_status.append("CANCEL")
+          if left_blinker: btn_status.append("LEFT")
+          if right_blinker: btn_status.append("RIGHT")
+          if gear_up: btn_status.append("GEAR_UP")
+          if gear_down: btn_status.append("GEAR_DOWN")
+          if cruise_up: btn_status.append("CRUISE+")
+          if cruise_down: btn_status.append("CRUISE-")
+          if cruise_main: btn_status.append("MAIN")
 
-        btn_str = f" [{', '.join(btn_status)}]" if btn_status else ""
-        print(f"Received: steer={steering:+.2f}, gas_brake={gas_brake:+.2f}{btn_str}")
+          btn_str = f" [{', '.join(btn_status)}]" if btn_status else ""
+          print(f"Received: steer={steering:+.2f}, gas_brake={gas_brake:+.2f}{btn_str}")
 
-        if pm is not None:
-          # Create and send the joystick message
-          joystick_msg = messaging.new_message('testJoystick')
-          joystick_msg.valid = True
-          joystick_msg.testJoystick.axes = [gas_brake, steering]
-          # Send buttons: [cancel, left_blinker, right_blinker, gear_up, gear_down, cruise_up, cruise_down, cruise_main]
-          joystick_msg.testJoystick.buttons = [cancel, left_blinker, right_blinker,
-                                                gear_up, gear_down, cruise_up, cruise_down, cruise_main]
-          pm.send('testJoystick', joystick_msg)
+          if pm is not None:
+            # Create and send the joystick message
+            joystick_msg = messaging.new_message('testJoystick')
+            joystick_msg.valid = True
+            joystick_msg.testJoystick.axes = [gas_brake, steering]
+            # Send buttons: [cancel, left_blinker, right_blinker, gear_up, gear_down, cruise_up, cruise_down, cruise_main]
+            joystick_msg.testJoystick.buttons = [cancel, left_blinker, right_blinker,
+                                                  gear_up, gear_down, cruise_up, cruise_down, cruise_main]
+            pm.send('testJoystick', joystick_msg)
 
 
 def main():

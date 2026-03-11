@@ -1,0 +1,19 @@
+{
+  "controller_name": "MOZA R5 Base",
+  "created_at_unix": 1773269486,
+  "axes": {
+    "steering": 0,
+    "gas": 2,
+    "brake": 5
+  },
+  "buttons": {
+    "cancel": 21,
+    "left_blinker": 13,
+    "right_blinker": 12,
+    "gear_up": 33,
+    "gear_down": 20,
+    "cruise_up": 4,
+    "cruise_down": 6,
+    "cruise_main": 34
+  }
+}

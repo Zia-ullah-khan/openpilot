@@ -9,6 +9,8 @@ import socket
 import struct
 import time
 import io
+import json
+from pathlib import Path
 
 try:
   import pygame
@@ -27,20 +29,30 @@ except ImportError:
 
 from tools.joystick.remoteControl import remote_control_thread
 
-# Button indices (match your wheel's button layout)
-# Run calibration mode to find which buttons are which
-BTN_CANCEL = 0        # Cancel cruise / disengage
-BTN_LEFT_BLINKER = 1  # Left turn signal
-BTN_RIGHT_BLINKER = 2 # Right turn signal
-BTN_GEAR_UP = 3       # Shift up (e.g., D -> R not supported on real car)
-BTN_GEAR_DOWN = 4     # Shift down
-BTN_CRUISE_UP = 5     # Increase cruise speed
-BTN_CRUISE_DOWN = 6   # Decrease cruise speed
-BTN_CRUISE_MAIN = 7   # Toggle cruise main
+# Default controls (used when no calibration JSON is available)
+DEFAULT_AXIS_MAP = {
+  'steering': 0,
+  'gas': 2,
+  'brake': 3,
+}
+
+DEFAULT_BUTTON_MAP = {
+  'cancel': 0,
+  'left_blinker': 1,
+  'right_blinker': 2,
+  'gear_up': 3,
+  'gear_down': 4,
+  'cruise_up': 5,
+  'cruise_down': 6,
+  'cruise_main': 7,
+}
+
+DEFAULT_CALIBRATION_FILE = Path(__file__).with_name('wheel_calibration.json')
 
 # Keyboard control settings
 KEYBOARD_STEER_SPEED = 2.0  # How fast steering moves with A/D (per second)
 KEYBOARD_STEER_RETURN = 3.0  # How fast steering returns to center (per second)
+BLINKER_PULSE_SECONDS = 0.35  # Keep blinker command active briefly on button tap
 
 # Global for video frame sharing
 latest_frame = None
@@ -240,7 +252,7 @@ class VideoReceiver:
 class MozaR5Wheel:
   """MOZA R5 Racing Wheel controller."""
 
-  def __init__(self, calibrate=False):
+  def __init__(self, calibration_config=None):
     pygame.init()
     pygame.joystick.init()
 
@@ -249,7 +261,7 @@ class MozaR5Wheel:
     self.gas = 0.0
     self.brake = 0.0
     self.buttons = []
-    self.calibrate = calibrate
+    self.calibration_config = calibration_config or {}
 
     # Find the MOZA wheel
     for i in range(pygame.joystick.get_count()):
@@ -275,15 +287,16 @@ class MozaR5Wheel:
     print(f"  Buttons: {self.wheel.get_numbuttons()}")
     print(f"  Hats: {self.wheel.get_numhats()}")
 
-    # Axis mapping - adjust these based on your wheel's axis layout
-    # MOZA R5 typical layout:
-    #   Axis 0: Steering wheel
-    #   Axis 1: Clutch (if equipped)
-    #   Axis 2: Gas pedal
-    #   Axis 3: Brake pedal
-    self.steering_axis = 0
-    self.gas_axis = 2       # May need adjustment
-    self.brake_axis = 3     # May need adjustment
+    axis_map = self.calibration_config.get('axes', {})
+    self.steering_axis = int(axis_map.get('steering', DEFAULT_AXIS_MAP['steering']))
+    self.gas_axis = int(axis_map.get('gas', DEFAULT_AXIS_MAP['gas']))
+    self.brake_axis = int(axis_map.get('brake', DEFAULT_AXIS_MAP['brake']))
+
+    button_map = self.calibration_config.get('buttons', {})
+    self.button_map = {
+      key: int(button_map.get(key, default_idx))
+      for key, default_idx in DEFAULT_BUTTON_MAP.items()
+    }
 
     # Initialize buttons list
     self.buttons = [False] * self.wheel.get_numbuttons()
@@ -311,39 +324,14 @@ class MozaR5Wheel:
       for i in range(self.wheel.get_numbuttons()):
         self.buttons[i] = self.wheel.get_button(i)
 
-      # Print calibration info if in calibrate mode
-      if self.calibrate:
-        self.print_calibration()
-
-  def print_calibration(self):
-    """Print all axis and button values for calibration."""
-    print("\033[H\033[J", end="")  # Clear screen
-    print("=== MOZA R5 Calibration Mode ===")
-    print("AXES:")
-    for i in range(self.wheel.get_numaxes()):
-      val = self.wheel.get_axis(i)
-      bar = "=" * int((val + 1) * 20)
-      print(f"  Axis {i}: {val:+.3f} [{bar:<40}]")
-
-    print("\nBUTTONS:")
-    for i in range(self.wheel.get_numbuttons()):
-      state = "PRESSED" if self.wheel.get_button(i) else "       "
-      print(f"  Button {i:2d}: {state}")
-
-    print("\nHATS (D-PAD):")
-    for i in range(self.wheel.get_numhats()):
-      hat = self.wheel.get_hat(i)
-      print(f"  Hat {i}: {hat}")
-
-    print("\nPress Ctrl+C to exit calibration mode")
-
   def get_gas_brake(self):
     """Return combined gas/brake value: positive = gas, negative = brake."""
     return self.gas - self.brake
 
-  def get_button(self, idx):
-    """Get button state by index."""
-    if idx < len(self.buttons):
+  def get_button_by_name(self, control_name):
+    """Get button state from logical control name."""
+    idx = self.button_map.get(control_name, -1)
+    if 0 <= idx < len(self.buttons):
       return self.buttons[idx]
     return False
 
@@ -351,7 +339,25 @@ class MozaR5Wheel:
     pygame.quit()
 
 
-def send_commands(host='127.0.0.1', port=6969, video_port=None, telemetry_port=None, use_keyboard=False):
+def load_calibration(calibration_file):
+  path = Path(calibration_file)
+  if not path.exists():
+    print(f"Calibration file not found: {path}. Using default mapping.")
+    return {}
+
+  try:
+    with path.open('r', encoding='utf-8') as f:
+      config = json.load(f)
+    print(f"Loaded calibration from {path}")
+    return config
+  except Exception as e:
+    print(f"Failed to load calibration from {path}: {e}")
+    print("Using default mapping.")
+    return {}
+
+
+def send_commands(host='127.0.0.1', port=6969, video_port=None, telemetry_port=None,
+                  use_keyboard=False, calibration_file=DEFAULT_CALIBRATION_FILE):
   """Send steering, gas/brake, and button commands to the remote control server."""
   global latest_frame, telemetry_data
 
@@ -361,9 +367,10 @@ def send_commands(host='127.0.0.1', port=6969, video_port=None, telemetry_port=N
   pygame.init()
 
   wheel = None
+  calibration_config = load_calibration(calibration_file)
   if not use_keyboard:
     try:
-      wheel = MozaR5Wheel()
+      wheel = MozaR5Wheel(calibration_config=calibration_config)
     except RuntimeError as e:
       print(f"Warning: {e}")
       print("Falling back to keyboard control (WASD + Q/E)")
@@ -377,6 +384,10 @@ def send_commands(host='127.0.0.1', port=6969, video_port=None, telemetry_port=N
   kb_right_blinker = False
   kb_cancel = False
   last_time = time.time()
+  left_blinker_until = 0.0
+  right_blinker_until = 0.0
+  prev_wheel_left = False
+  prev_wheel_right = False
 
   # Start video receiver if enabled
   video_receiver = None
@@ -413,8 +424,7 @@ def send_commands(host='127.0.0.1', port=6969, video_port=None, telemetry_port=N
       print("  Close window or Ctrl+C to exit")
     else:
       print("Use your MOZA R5 wheel to control. Press Ctrl+C or close window to exit.")
-      print("\nButton mappings (edit BTN_* constants to match your wheel):")
-      print(f"  BTN_CANCEL={BTN_CANCEL}, BTN_LEFT_BLINKER={BTN_LEFT_BLINKER}, BTN_RIGHT_BLINKER={BTN_RIGHT_BLINKER}")
+      print("\nButton mappings loaded from calibration JSON (or defaults if missing).")
 
     try:
       running = True
@@ -432,8 +442,12 @@ def send_commands(host='127.0.0.1', port=6969, video_port=None, telemetry_port=N
           elif event.type == pygame.KEYDOWN and use_keyboard:
             if event.key == pygame.K_q:
               kb_left_blinker = True
+              left_blinker_until = current_time + BLINKER_PULSE_SECONDS
+              right_blinker_until = 0.0
             elif event.key == pygame.K_e:
               kb_right_blinker = True
+              right_blinker_until = current_time + BLINKER_PULSE_SECONDS
+              left_blinker_until = 0.0
             elif event.key == pygame.K_ESCAPE:
               kb_cancel = True
           elif event.type == pygame.KEYUP and use_keyboard:
@@ -477,18 +491,39 @@ def send_commands(host='127.0.0.1', port=6969, video_port=None, telemetry_port=N
         # Pack buttons into a bitmask (up to 8 buttons in one byte)
         button_mask = 0
         if use_keyboard:
-          if kb_cancel: button_mask |= (1 << 0)
-          if kb_left_blinker: button_mask |= (1 << 1)
-          if kb_right_blinker: button_mask |= (1 << 2)
+          if kb_cancel:
+            button_mask |= (1 << 0)
+          left_blinker_active = kb_left_blinker or (current_time < left_blinker_until)
+          right_blinker_active = kb_right_blinker or (current_time < right_blinker_until)
+          if left_blinker_active:
+            button_mask |= (1 << 1)
+          if right_blinker_active:
+            button_mask |= (1 << 2)
         else:
-          if wheel.get_button(BTN_CANCEL): button_mask |= (1 << 0)
-          if wheel.get_button(BTN_LEFT_BLINKER): button_mask |= (1 << 1)
-          if wheel.get_button(BTN_RIGHT_BLINKER): button_mask |= (1 << 2)
-          if wheel.get_button(BTN_GEAR_UP): button_mask |= (1 << 3)
-          if wheel.get_button(BTN_GEAR_DOWN): button_mask |= (1 << 4)
-          if wheel.get_button(BTN_CRUISE_UP): button_mask |= (1 << 5)
-          if wheel.get_button(BTN_CRUISE_DOWN): button_mask |= (1 << 6)
-          if wheel.get_button(BTN_CRUISE_MAIN): button_mask |= (1 << 7)
+          wheel_left = wheel.get_button_by_name('left_blinker')
+          wheel_right = wheel.get_button_by_name('right_blinker')
+
+          # Convert a short tap into a minimum pulse so the receiver always sees it.
+          if wheel_left and not prev_wheel_left:
+            left_blinker_until = current_time + BLINKER_PULSE_SECONDS
+            right_blinker_until = 0.0
+          if wheel_right and not prev_wheel_right:
+            right_blinker_until = current_time + BLINKER_PULSE_SECONDS
+            left_blinker_until = 0.0
+
+          prev_wheel_left = wheel_left
+          prev_wheel_right = wheel_right
+
+          if wheel.get_button_by_name('cancel'): button_mask |= (1 << 0)
+          left_blinker_active = wheel_left or (current_time < left_blinker_until)
+          right_blinker_active = wheel_right or (current_time < right_blinker_until)
+          if left_blinker_active: button_mask |= (1 << 1)
+          if right_blinker_active: button_mask |= (1 << 2)
+          if wheel.get_button_by_name('gear_up'): button_mask |= (1 << 3)
+          if wheel.get_button_by_name('gear_down'): button_mask |= (1 << 4)
+          if wheel.get_button_by_name('cruise_up'): button_mask |= (1 << 5)
+          if wheel.get_button_by_name('cruise_down'): button_mask |= (1 << 6)
+          if wheel.get_button_by_name('cruise_main'): button_mask |= (1 << 7)
 
         # Pack: steering (float), gas_brake (float), buttons (byte)
         data = struct.pack('ffB', steering, gas_brake, button_mask)
@@ -496,10 +531,7 @@ def send_commands(host='127.0.0.1', port=6969, video_port=None, telemetry_port=N
 
         # Display video if available
         if screen:
-          # Clear screen with dark background for keyboard-only mode
-          if not video_receiver:
-            screen.fill((30, 30, 40))
-
+          frame_surface = None
           if video_receiver:
             with frame_lock:
               frame = latest_frame
@@ -510,13 +542,14 @@ def send_commands(host='127.0.0.1', port=6969, video_port=None, telemetry_port=N
                 frame_surface = pygame.surfarray.make_surface(frame.swapaxes(0, 1))
               elif isinstance(frame, pygame.Surface):
                 frame_surface = frame
-              else:
-                frame_surface = None
 
-              if frame_surface:
-                # Scale to fit window
-                scaled = pygame.transform.scale(frame_surface, screen.get_size())
-                screen.blit(scaled, (0, 0))
+          if frame_surface is not None:
+            # Scale to fit window
+            scaled = pygame.transform.scale(frame_surface, screen.get_size())
+            screen.blit(scaled, (0, 0))
+          else:
+            # Always clear when no frame is available, otherwise text overlays accumulate.
+            screen.fill((30, 30, 40))
 
           # Draw HUD overlay
           font = pygame.font.Font(None, 36)
@@ -670,25 +703,9 @@ def send_commands(host='127.0.0.1', port=6969, video_port=None, telemetry_port=N
         telemetry_receiver.stop()
 
 
-def calibrate_wheel():
-  """Run calibration mode to identify axis and button mappings."""
-  print("Starting calibration mode...")
-  wheel = MozaR5Wheel(calibrate=True)
-
-  try:
-    while True:
-      wheel.update()
-      time.sleep(0.1)
-  except KeyboardInterrupt:
-    print("\nCalibration complete.")
-  finally:
-    wheel.close()
-
-
 def main():
   import argparse
   parser = argparse.ArgumentParser(description='MOZA R5 Wheel Remote Control')
-  parser.add_argument('--calibrate', action='store_true', help='Run calibration mode to find axis/button mappings')
   parser.add_argument('--host', default='127.0.0.1', help='Remote server host (default: 127.0.0.1)')
   parser.add_argument('--port', type=int, default=6969, help='Remote server port (default: 6969)')
   parser.add_argument('--video', action='store_true', help='Enable video streaming')
@@ -697,11 +714,9 @@ def main():
   parser.add_argument('--telemetry-port', type=int, default=6971, help='Telemetry stream port (default: 6971)')
   parser.add_argument('--keyboard', action='store_true', help='Use keyboard (WASD+QE) instead of wheel')
   parser.add_argument('--no-server', action='store_true', help='Connect to existing server (don\'t start local)')
+  parser.add_argument('--calibration-file', default=str(DEFAULT_CALIBRATION_FILE),
+                      help=f'Wheel calibration JSON path (default: {DEFAULT_CALIBRATION_FILE.name})')
   args = parser.parse_args()
-
-  if args.calibrate:
-    calibrate_wheel()
-    return
 
   if not args.no_server:
     # Start server in background thread
@@ -712,7 +727,8 @@ def main():
   video_port = args.video_port if args.video else None
   telemetry_port = args.telemetry_port if args.telemetry else None
   send_commands(host=args.host, port=args.port, video_port=video_port,
-                telemetry_port=telemetry_port, use_keyboard=args.keyboard)
+                telemetry_port=telemetry_port, use_keyboard=args.keyboard,
+                calibration_file=args.calibration_file)
 
   print("Done sending commands")
 

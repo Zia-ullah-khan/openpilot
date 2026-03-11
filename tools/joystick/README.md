@@ -15,11 +15,14 @@ python tools/joystick/remoteControl.py --video --camera driver --fps 15
 python tools/joystick/remoteControl.py --video --control-port 6969 --video-port 6970
 
 # On Your PC (Client)
-# Calibration - find your wheel's axis/button mappings
-python TestRemotecontrol.py --calibrate
+# Calibration - interactive axis/button mapping saved to JSON
+python tools/joystick/wheel_calibration.py
 
 # Connect to comma device (replace with your comma's IP)
 python TestRemotecontrol.py --host 192.168.1.X --no-server
+
+# Connect to comma with explicit calibration file
+python TestRemotecontrol.py --host 192.168.1.X --calibration-file tools/joystick/wheel_calibration.json --no-server
 
 # Connect with video
 python TestRemotecontrol.py --host 192.168.1.X --video --no-server
